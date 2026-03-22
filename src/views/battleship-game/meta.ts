@@ -6,6 +6,7 @@ const meta: PageMeta = {
     'Trò chơi Bắn Tàu (BattleShip) - Tìm và phá hủy hạm đội của đối phương trước khi hết lượt!',
   author: 'nughnguyen',
   category: 'game',
+  facebook: 'https://github.com/nughnguyen',
 }
 
 export default meta
