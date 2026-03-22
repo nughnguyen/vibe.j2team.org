@@ -1,9 +1,8 @@
 import type { PageMeta } from '@/types/page'
 
 const meta: PageMeta = {
-  name: 'BattleShip Game',
-  description:
-    'Trò chơi Bắn Tàu (BattleShip) - Tìm và phá hủy hạm đội của đối phương trước khi hết lượt!',
+  name: 'Scribble',
+  description: 'Trò chơi Đoán chữ vẽ hình (Scribble) nhiều người chơi - Vẽ nhanh, đoán chuẩn!',
   author: 'nughnguyen',
   category: 'game',
   facebook: 'https://github.com/nughnguyen',
