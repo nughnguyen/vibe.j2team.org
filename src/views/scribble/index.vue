@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, onUnmounted, nextTick } from 'vue'
 
-const WS_URL = 'wss://socketsbay.com/wss/v2/1/demo/'
 const WORDS = [
   'Mèo',
   'Chó',
@@ -37,13 +36,17 @@ const WORDS = [
   'Răng',
 ]
 
-type GameState = 'LOBBY' | 'MATCHMAKING' | 'WAITING_OPPONENT' | 'PLAYING' | 'END_ROUND'
+type GameState = 'LOBBY' | 'WAITING_OPPONENT' | 'PLAYING' | 'END_ROUND'
 
 const state = ref<GameState>('LOBBY')
 const roomId = ref('')
 const inputRoomId = ref('')
-const socket = ref<WebSocket | null>(null)
-const connectionStatus = ref('Đang lặp kết nối...')
+const connectionStatus = ref('Chưa kết nối')
+
+// PeerJS Networking
+declare let Peer: unknown
+const peer = ref<unknown>(null)
+const conn = ref<unknown>(null)
 
 // Role logic
 const myRole = ref<'drawer' | 'guesser' | null>(null)
@@ -56,56 +59,95 @@ const roundWinnerMessage = ref('')
 // Canvas Drawing
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const isDrawing = ref(false)
-const ctx = ref<CanvasRenderingContextElement | null>(null)
+const ctx = ref<CanvasRenderingContext2D | null>(null)
 const selectedColor = ref('#000000')
 const selectedSize = ref(3)
 
 let lastX = 0
 let lastY = 0
 
-// Network & Flow
-function connectWs() {
-  connectionStatus.value = 'Đang kết nối WebSocket...'
-  socket.value = new WebSocket(WS_URL)
+// Inject PeerJS script dynamically
+function initPeerJs(): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (window.hasOwnProperty('Peer')) return resolve(true)
+    const script = document.createElement('script')
+    script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js'
+    script.onload = () => resolve(true)
+    document.head.appendChild(script)
+  })
+}
 
-  socket.value.onopen = () => {
-    connectionStatus.value = 'Đã kết nối máy chủ'
-  }
+async function createRoom() {
+  await initPeerJs()
+  connectionStatus.value = 'Đang tạo phòng P2P...'
+  roomId.value = Math.random().toString(36).substring(2, 8).toUpperCase()
 
-  socket.value.onmessage = (event) => {
+  peer.value = new Peer('vibescribble-' + roomId.value)
+
+  peer.value.on('open', () => {
+    connectionStatus.value = 'Phòng đã sẵn sàng'
+    state.value = 'WAITING_OPPONENT'
+    myRole.value = 'drawer'
+    currentWord.value = getRandomWord()
+  })
+
+  peer.value.on('connection', (c: unknown) => {
+    // Someone joined
+    conn.value = c
+    setupConn()
+    connectionStatus.value = 'Đã kết nối với đối thủ!'
+
+    // Give connection a moment to establish, then start
+    setTimeout(() => {
+      conn.value.send(JSON.stringify({ type: 'SYNC_START', word: currentWord.value }))
+      startGameAs('drawer')
+    }, 1000)
+  })
+
+  peer.value.on('error', (err: unknown) => {
+    connectionStatus.value = 'Lỗi tạo phòng: ' + (err as { type: string }).type
+    state.value = 'LOBBY'
+  })
+}
+
+async function joinRoomBtn() {
+  if (!inputRoomId.value) return
+  await initPeerJs()
+  connectionStatus.value = 'Đang tìm phòng...'
+  roomId.value = inputRoomId.value.toUpperCase()
+
+  peer.value = new Peer()
+
+  peer.value.on('open', () => {
+    // Attempt to connect to the host
+    conn.value = peer.value.connect('vibescribble-' + roomId.value)
+
+    conn.value.on('open', () => {
+      connectionStatus.value = 'Đã kết nối!'
+      setupConn()
+      state.value = 'WAITING_OPPONENT'
+      myRole.value = 'guesser'
+    })
+
+    conn.value.on('error', () => {
+      connectionStatus.value = 'Không tìm thấy phòng'
+      state.value = 'LOBBY'
+    })
+  })
+
+  peer.value.on('error', () => {
+    connectionStatus.value = 'Phòng không tồn tại hoặc lỗi mạng'
+    state.value = 'LOBBY'
+  })
+}
+
+function setupConn() {
+  conn.value.on('data', (dataStr: string) => {
     try {
-      const data = JSON.parse(event.data)
-      if (data.game !== 'scribble-vibe') return
-
-      // Matchmaking
-      if (
-        state.value === 'MATCHMAKING' &&
-        data.type === 'MATCH_REQUEST' &&
-        data.sender !== socket.value
-      ) {
-        roomId.value = data.roomId
-        joinRoomLogic('drawer')
-        sendWs({ type: 'MATCH_ACCEPTED', roomId: roomId.value })
-      } else if (
-        state.value === 'MATCHMAKING' &&
-        data.type === 'MATCH_ACCEPTED' &&
-        data.roomId === roomId.value
-      ) {
-        joinRoomLogic('guesser')
-      }
-
-      if (data.roomId !== roomId.value) return // Ignore other rooms
-
-      if (data.type === 'JOIN_ROOM') {
-        if (state.value === 'WAITING_OPPONENT') {
-          // I created the room, so I start as Drawer. Opponent joined.
-          startGameAs('drawer')
-          sendWs({ type: 'SYNC_START', word: currentWord.value })
-        }
-      }
+      const data = JSON.parse(dataStr)
 
       if (data.type === 'SYNC_START') {
-        if (state.value === 'WAITING_OPPONENT') {
+        if (state.value === 'WAITING_OPPONENT' || state.value === 'END_ROUND') {
           currentWord.value = data.word
           startGameAs('guesser')
         }
@@ -127,58 +169,25 @@ function connectWs() {
         }
       }
     } catch {
-      // Not JSON
+      // Ignore bad payload
     }
-  }
+  })
 
-  socket.value.onclose = () => {
-    connectionStatus.value = 'Mất kết nối'
-  }
+  conn.value.on('close', () => {
+    connectionStatus.value = 'Đối thủ đã ngắt kết nối'
+    state.value = 'LOBBY'
+    alert('Đối thủ đã thoát phòng!')
+  })
 }
 
 function sendWs(data: Record<string, unknown>) {
-  if (socket.value && socket.value.readyState === WebSocket.OPEN) {
-    socket.value.send(JSON.stringify({ ...data, game: 'scribble-vibe', roomId: roomId.value }))
+  if (conn.value && conn.value.open) {
+    conn.value.send(JSON.stringify(data))
   }
 }
 
 function getRandomWord() {
   return WORDS[Math.floor(Math.random() * WORDS.length)]
-}
-
-// Lobby actions
-function createRoom() {
-  roomId.value = Math.random().toString(36).substring(2, 8).toUpperCase()
-  state.value = 'WAITING_OPPONENT'
-  myRole.value = 'drawer'
-  currentWord.value = getRandomWord()
-}
-
-function joinRoomBtn() {
-  if (!inputRoomId.value) return
-  roomId.value = inputRoomId.value.toUpperCase()
-  state.value = 'WAITING_OPPONENT'
-  myRole.value = 'guesser'
-  sendWs({ type: 'JOIN_ROOM', roomId: roomId.value })
-}
-
-function randomMatch() {
-  state.value = 'MATCHMAKING'
-  roomId.value = Math.random().toString(36).substring(2, 8).toUpperCase()
-  sendWs({ type: 'MATCH_REQUEST', roomId: roomId.value })
-}
-
-function joinRoomLogic(role: 'drawer' | 'guesser') {
-  myRole.value = role
-  if (role === 'drawer') {
-    currentWord.value = getRandomWord()
-    startGameAs('drawer')
-    setTimeout(() => {
-      sendWs({ type: 'SYNC_START', word: currentWord.value })
-    }, 500)
-  } else {
-    state.value = 'WAITING_OPPONENT'
-  }
 }
 
 function startGameAs(role: 'drawer' | 'guesser') {
@@ -208,9 +217,6 @@ function endRound(winner: 'me' | 'opponent') {
       startGameAs('drawer')
       sendWs({ type: 'NEW_ROUND', word: currentWord.value })
     }, 4000)
-  } else {
-    // Opponent won, meaning I was Drawer and now I become Guesser.
-    // Wait for NEW_ROUND event.
   }
 }
 
@@ -233,7 +239,7 @@ function sendGuess() {
 // Canvas
 function initCanvas() {
   if (!canvasRef.value) return
-  ctx.value = canvasRef.value.getContext('2d') as CanvasRenderingContextElement
+  ctx.value = canvasRef.value.getContext('2d') as CanvasRenderingContext2D
   resizeCanvas()
   window.addEventListener('resize', resizeCanvas)
 }
@@ -243,7 +249,7 @@ function resizeCanvas() {
     const parent = canvasRef.value.parentElement
     if (parent) {
       canvasRef.value.width = parent.clientWidth
-      canvasRef.value.height = parent.clientWidth // Square or fixed height
+      canvasRef.value.height = parent.clientWidth // Square
     }
   }
 }
@@ -289,8 +295,7 @@ function drawLine(
   ctx.value.stroke()
   ctx.value.closePath()
 
-  if (emit && socket.value?.readyState === WebSocket.OPEN) {
-    // throttle or send directly
+  if (emit) {
     sendWs({ type: 'DRAW', x0, y0, x1, y1, color, size })
   }
 }
@@ -320,11 +325,9 @@ function clearCanvas(emit: boolean) {
   }
 }
 
-onMounted(() => {
-  connectWs()
-})
 onUnmounted(() => {
-  if (socket.value) socket.value.close()
+  if (conn.value) conn.value.close()
+  if (peer.value) peer.value.destroy()
   window.removeEventListener('resize', resizeCanvas)
 })
 </script>
@@ -348,56 +351,44 @@ onUnmounted(() => {
 
     <!-- 1. Lobby -->
     <div
-      v-if="state === 'LOBBY' || state === 'MATCHMAKING'"
+      v-if="state === 'LOBBY'"
       class="w-full max-w-md bg-slate-800 p-6 rounded-2xl shadow-xl flex flex-col gap-4"
     >
       <h1 class="text-3xl font-black text-center text-blue-400 mb-2">SCRIBBLE</h1>
       <p class="text-sm text-slate-400 text-center mb-4">Đoán Chữ Vẽ Hình - Tác giả: nughnguyen</p>
 
-      <div
-        v-if="state === 'MATCHMAKING'"
-        class="text-center py-10 animate-pulse text-yellow-400 font-bold"
+      <button
+        @click="createRoom"
+        class="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-white transition-all shadow-lg shadow-blue-500/30"
       >
-        Đang tìm người chơi ngẫu nhiên...
+        TẠO PHÒNG MỚI
+      </button>
+
+      <div class="relative flex items-center py-2">
+        <div class="grow border-t border-slate-700"></div>
+        <span class="shrink-0 mx-4 text-slate-500 text-sm">hoặc</span>
+        <div class="grow border-t border-slate-700"></div>
       </div>
 
-      <template v-else>
+      <div class="flex gap-2">
+        <input
+          v-model="inputRoomId"
+          placeholder="Nhập ID Phòng..."
+          class="flex-1 bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 text-white uppercase"
+          maxlength="6"
+          @keyup.enter="joinRoomBtn"
+        />
         <button
-          @click="createRoom"
-          class="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-white transition-all shadow-lg shadow-blue-500/30"
+          @click="joinRoomBtn"
+          class="px-6 bg-slate-700 hover:bg-slate-600 border border-slate-600 rounded-xl font-bold transition-all"
         >
-          TẠO PHÒNG MỚI
+          VÀO
         </button>
+      </div>
 
-        <div class="relative flex items-center py-2">
-          <div class="grow border-t border-slate-700"></div>
-          <span class="shrink-0 mx-4 text-slate-500 text-sm">hoặc</span>
-          <div class="grow border-t border-slate-700"></div>
-        </div>
-
-        <div class="flex gap-2">
-          <input
-            v-model="inputRoomId"
-            placeholder="Nhập ID Phòng..."
-            class="flex-1 bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 text-white uppercase"
-            maxlength="6"
-            @keyup.enter="joinRoomBtn"
-          />
-          <button
-            @click="joinRoomBtn"
-            class="px-6 bg-slate-700 hover:bg-slate-600 border border-slate-600 rounded-xl font-bold transition-all"
-          >
-            VÀO
-          </button>
-        </div>
-
-        <button
-          @click="randomMatch"
-          class="w-full py-3 mt-4 bg-purple-600 hover:bg-purple-500 rounded-xl font-bold text-white transition-all flex justify-center items-center gap-2"
-        >
-          GHÉP NGẪU NHIÊN 🎲
-        </button>
-      </template>
+      <p class="text-xs text-slate-500 text-center mt-2">
+        Tính năng ghép ngẫu nhiên đã được vô hiệu hoá để đảm bảo đường truyền P2P tốc độ cao.
+      </p>
     </div>
 
     <!-- 2. Waiting -->
@@ -450,7 +441,7 @@ onUnmounted(() => {
         class="p-6 text-center text-xl font-bold text-yellow-400 animate-pulse bg-slate-700 rounded-xl"
       >
         {{ roundWinnerMessage }}<br />
-        <span class="text-sm text-slate-300 font-normal mt-2 block">Chuẩn bị ván mới...</span>
+        <span class="text-sm text-slate-300 font-normal mt-2 block">Chuẩn bị đổi phiên...</span>
       </div>
 
       <!-- Canvas Area -->
@@ -470,7 +461,6 @@ onUnmounted(() => {
           @touchend.prevent="stopDrawing"
         ></canvas>
 
-        <!-- Overlay for guesser so they don't draw by accident (optional) -->
         <div v-if="myRole === 'guesser'" class="absolute inset-0 pointer-events-none"></div>
       </div>
 
@@ -526,7 +516,7 @@ onUnmounted(() => {
           <input
             v-model="currentGuess"
             @keyup.enter="sendGuess"
-            placeholder="Nhắn tĩnh để đoán từ..."
+            placeholder="Nhắn tin để đoán..."
             class="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
           />
           <button @click="sendGuess" class="bg-blue-600 px-4 py-2 rounded-lg font-bold">Gửi</button>

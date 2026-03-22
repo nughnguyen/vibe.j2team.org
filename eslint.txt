@@ -1,0 +1,6 @@
+﻿
+D:\Code Dev\Github\J2TEAM\vibe.j2team.org\src\views\scribble\index.vue
+  2:15  error  'onMounted' is defined but never used  @typescript-eslint/no-unused-vars
+
+✖ 1 problem (1 error, 0 warnings)
+
